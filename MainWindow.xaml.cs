@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Text.Json;
 using System.Xml.Serialization;
@@ -45,6 +46,12 @@ namespace MsfsLogbookAnalyzer
 
             var result = await RunOCR((BitmapSource)MyImageControl.Source);
 
+            if (DebugModeCheckBox.IsChecked == true)
+            {
+                OutputTextBox.Text = GetDebugOutput(result);
+                return;
+            }
+
             var records = BuildRows(result);
 
             OutputTextBox.Text = string.Empty;
@@ -74,8 +81,11 @@ namespace MsfsLogbookAnalyzer
         // 🧠 OCR Engine
         private async Task<OcrResult> RunOCR(BitmapSource bitmap)
         {
+            // Preprocess before first await so it runs on the UI thread
+            var preprocessed = PreprocessForOcr(bitmap);
+
             var encoder = new PngBitmapEncoder();
-            encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bitmap));
+            encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(preprocessed));
 
             using var stream = new MemoryStream();
             encoder.Save(stream);
@@ -86,6 +96,37 @@ namespace MsfsLogbookAnalyzer
 
             var ocrEngine = OcrEngine.TryCreateFromUserProfileLanguages();
             return await ocrEngine.RecognizeAsync(softwareBitmap);
+        }
+
+        // Scale up 2× and invert colors so Windows OCR gets dark text on a light background
+        private static BitmapSource PreprocessForOcr(BitmapSource source)
+        {
+            const double scale = 2.0;
+            int w = (int)(source.PixelWidth * scale);
+            int h = (int)(source.PixelHeight * scale);
+
+            var visual = new DrawingVisual();
+            using (var dc = visual.RenderOpen())
+                dc.DrawImage(source, new Rect(0, 0, w, h));
+
+            var scaled = new RenderTargetBitmap(w, h, 96, 96, PixelFormats.Pbgra32);
+            scaled.Render(visual);
+
+            // Convert to Bgra32 and invert R, G, B channels
+            var converted = new FormatConvertedBitmap(scaled, PixelFormats.Bgra32, null, 0);
+            int stride = w * 4;
+            byte[] pixels = new byte[h * stride];
+            converted.CopyPixels(pixels, stride, 0);
+
+            for (int i = 0; i < pixels.Length; i += 4)
+            {
+                pixels[i]     = (byte)(255 - pixels[i]);     // B
+                pixels[i + 1] = (byte)(255 - pixels[i + 1]); // G
+                pixels[i + 2] = (byte)(255 - pixels[i + 2]); // R
+                // alpha unchanged
+            }
+
+            return BitmapSource.Create(w, h, 96, 96, PixelFormats.Bgra32, null, pixels, stride);
         }
 
         // 🧱 Build rows from OCR (KEY PART)
@@ -105,7 +146,7 @@ namespace MsfsLogbookAnalyzer
                 .ToList();
 
             var rows = new List<List<WordBox>>();
-            const double threshold = 12.0;
+            const double threshold = 20.0;
 
             foreach (var word in words)
             {
@@ -128,15 +169,17 @@ namespace MsfsLogbookAnalyzer
                 row.Sort((a, b) => a.X.CompareTo(b.X));
             }
 
+            var rowTokens = rows
+                .Select(row => row.Select(w => w.Text ?? string.Empty).Where(t => !string.IsNullOrWhiteSpace(t)).ToList())
+                .Where(tokens => tokens.Count > 0)
+                .ToList();
+
+            rowTokens = MergeSplitRows(rowTokens);
+
             var records = new List<FlightRecord>();
 
-            foreach (var row in rows)
+            foreach (var tokens in rowTokens)
             {
-                var tokens = row
-                    .Select(w => w.Text ?? string.Empty)
-                    .Where(t => !string.IsNullOrWhiteSpace(t))
-                    .ToList();
-
                 if (tokens.Count == 0)
                     continue;
 
@@ -152,6 +195,70 @@ namespace MsfsLogbookAnalyzer
         private string GetRawOcrText(OcrResult result)
         {
             return string.Join("\n", result.Lines.Select(line => string.Join(" ", line.Words.Select(w => w.Text))));
+        }
+
+        private string GetDebugOutput(OcrResult result)
+        {
+            var sb = new StringBuilder();
+
+            // 1. Raw OCR words with positions
+            sb.AppendLine("=== RAW OCR WORDS (x, y, text) ===");
+            foreach (var line in result.Lines)
+                foreach (var word in line.Words)
+                    sb.AppendLine($"  ({word.BoundingRect.X:F0}, {word.BoundingRect.Y:F0})  \"{word.Text}\"  → normalized: \"{NormalizeText(word.Text)}\"");
+
+            // 2. Y-grouped rows before merge
+            var words = result.Lines
+                .SelectMany(l => l.Words)
+                .Select(w => new WordBox { Text = NormalizeText(w.Text), X = w.BoundingRect.X, Y = w.BoundingRect.Y })
+                .Where(w => !string.IsNullOrWhiteSpace(w.Text))
+                .OrderBy(w => w.Y).ThenBy(w => w.X)
+                .ToList();
+
+            var rawRows = new List<List<WordBox>>();
+            const double threshold = 20.0;
+            foreach (var word in words)
+            {
+                var row = rawRows
+                    .OrderBy(r => Math.Abs(r.Average(w => w.Y) - word.Y))
+                    .FirstOrDefault(r => Math.Abs(r.Average(w => w.Y) - word.Y) < threshold);
+                if (row == null) rawRows.Add(new List<WordBox> { word });
+                else row.Add(word);
+            }
+            foreach (var row in rawRows) row.Sort((a, b) => a.X.CompareTo(b.X));
+
+            sb.AppendLine("\n=== Y-GROUPED ROWS (before merge) ===");
+            for (int i = 0; i < rawRows.Count; i++)
+            {
+                var avgY = rawRows[i].Average(w => w.Y);
+                var tokens = rawRows[i].Select(w => w.Text ?? "").ToList();
+                sb.AppendLine($"  Row {i + 1} (avgY={avgY:F0}): {string.Join(" | ", tokens)}");
+            }
+
+            // 3. Rows after merge
+            var tokenRows = rawRows
+                .Select(row => row.Select(w => w.Text ?? "").Where(t => !string.IsNullOrWhiteSpace(t)).ToList())
+                .Where(t => t.Count > 0)
+                .ToList();
+            var merged = MergeSplitRows(tokenRows);
+
+            sb.AppendLine("\n=== ROWS AFTER MERGE ===");
+            for (int i = 0; i < merged.Count; i++)
+                sb.AppendLine($"  Row {i + 1}: {string.Join(" | ", merged[i])}");
+
+            // 4. Parse result per merged row
+            sb.AppendLine("\n=== PARSE RESULTS ===");
+            for (int i = 0; i < merged.Count; i++)
+            {
+                var tokens = merged[i];
+                var record = ParseRow(tokens);
+                if (record != null)
+                    sb.AppendLine($"  Row {i + 1}: OK  →  {record.Date} | {record.Aircraft} | {record.From} → {record.To} | {record.Duration}");
+                else
+                    sb.AppendLine($"  Row {i + 1}: REJECTED  ({GetRejectReason(tokens)})  tokens: {string.Join(" | ", tokens)}");
+            }
+
+            return sb.ToString();
         }
 
         private string GetOcrDebugText(OcrResult result)
@@ -186,12 +293,13 @@ namespace MsfsLogbookAnalyzer
             if (normalizedTokens.FirstOrDefault(IsDateToken) == null)
                 return "Missing date";
 
-            var timeTokens = normalizedTokens.Where(IsTimeToken).ToList();
-            if (timeTokens.Count < 2)
-                return "Missing departure or arrival time";
-
-            if (normalizedTokens.Count(IsIcaoCode) < 2)
-                return "Missing from/to ICAO codes";
+            var airportCount = normalizedTokens
+                .Select(ExtractIcaoCode)
+                .Count(code => !string.IsNullOrWhiteSpace(code));
+            if (airportCount == 0)
+                return "No ICAO airport code found";
+            if (airportCount == 1)
+                return "Only one airport code found (missing To)";
 
             return "Could not build a complete flight record";
         }
@@ -212,7 +320,7 @@ namespace MsfsLogbookAnalyzer
                 .ToList();
 
             var rows = new List<List<WordBox>>();
-            const double threshold = 12.0;
+            const double threshold = 20.0;
 
             foreach (var word in words)
             {
@@ -241,6 +349,122 @@ namespace MsfsLogbookAnalyzer
                 .ToList();
         }
 
+        private static List<List<string>> MergeSplitRows(List<List<string>> rows)
+        {
+            var result = new List<List<string>>();
+            int i = 0;
+
+            while (i < rows.Count)
+            {
+                var current = rows[i];
+                while (i + 1 < rows.Count && ShouldMergeRows(current, rows[i + 1]))
+                {
+                    current = RemoveDuplicateAdjacentTokens(current.Concat(rows[i + 1]).ToList());
+                    i++;
+                }
+                result.Add(current);
+                i++;
+            }
+
+            return result;
+        }
+
+        private static bool ShouldMergeRows(List<string> left, List<string> right)
+        {
+            if (left.Count == 0 || right.Count == 0)
+                return false;
+
+            var leftNorm = left.Select(NormalizeText).ToList();
+            var rightNorm = right.Select(NormalizeText).ToList();
+
+            if (StartsWithDate(leftNorm) && !StartsWithDate(rightNorm))
+            {
+                return IsContinuationRow(leftNorm, rightNorm);
+            }
+
+            if (!StartsWithDate(leftNorm) && StartsWithDate(rightNorm))
+            {
+                return IsContinuationRow(rightNorm, leftNorm);
+            }
+
+            if (!leftNorm[0].Equals(rightNorm[0], StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (leftNorm.Count > 1 && rightNorm.Count > 1 && !leftNorm[1].Equals(rightNorm[1], StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            int matchingPrefix = leftNorm.Zip(rightNorm, (a, b) => a == b ? 1 : 0).Take(6).Sum();
+            if (matchingPrefix < 4)
+                return false;
+
+            return IsPrefix(leftNorm, rightNorm) || IsPrefix(rightNorm, leftNorm);
+        }
+
+        private static bool IsContinuationRow(List<string> rowWithDate, List<string> possibleContinuation)
+        {
+            if (possibleContinuation.Count == 0)
+                return false;
+
+            if (!HasOnlyFromCode(rowWithDate))
+                return false;
+
+            if (StartsWithDate(possibleContinuation))
+                return false;
+
+            return IsTimeToken(possibleContinuation[0]) || ExtractIcaoCode(possibleContinuation[0]) != null;
+        }
+
+        // Returns true when a row has exactly one extractable airport code — meaning it still needs the "to" airport
+        private static bool HasOnlyFromCode(List<string> tokens)
+        {
+            var normalized = tokens.Select(NormalizeText).ToList();
+            int firstAirportIndex = normalized.FindIndex(t => ExtractIcaoCode(t) != null);
+            if (firstAirportIndex < 0)
+                return false;
+
+            var airportCodes = normalized
+                .Skip(firstAirportIndex)
+                .Select(ExtractIcaoCode)
+                .Where(code => !string.IsNullOrWhiteSpace(code))
+                .ToList();
+
+            return airportCodes.Count == 1;
+        }
+
+        private static bool IsPrefix(List<string> a, List<string> b)
+        {
+            if (a.Count >= b.Count)
+                return false;
+
+            for (int i = 0; i < a.Count; i++)
+            {
+                if (!a[i].Equals(b[i], StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool StartsWithDate(List<string> tokens)
+        {
+            return tokens.Count > 0 && IsDateToken(tokens[0]);
+        }
+
+        private static List<string> RemoveDuplicateAdjacentTokens(List<string> tokens)
+        {
+            var result = new List<string>();
+
+            foreach (var token in tokens)
+            {
+                if (result.Count == 0 || !result.Last().Equals(token, StringComparison.OrdinalIgnoreCase))
+                {
+                    result.Add(token);
+                }
+            }
+
+            return result;
+        }
+
         // ✈️ Parse a single row into a flight record
         private FlightRecord? ParseRow(List<string> tokens)
         {
@@ -264,33 +488,64 @@ namespace MsfsLogbookAnalyzer
             string type = typeIndex >= 0 ? normalizedTokens[typeIndex] : string.Empty;
             int aircraftStart = typeIndex >= 0 ? typeIndex + 1 : searchStart;
 
-            var timeTokens = normalizedTokens.Where(IsTimeToken).ToList();
-            string? departureTime = timeTokens.ElementAtOrDefault(0);
-            string? arrivalTime = timeTokens.ElementAtOrDefault(1);
-            string? duration = normalizedTokens.FirstOrDefault(IsDurationToken) ?? string.Empty;
+            // Determine the aircraft name boundary using whichever anchor comes first:
+            //   • A time token (departure time) — the normal case
+            //   • A bracketed airport code [XXXX] — fallback when departure time is absent
+            // Plain ICAO codes (e.g. "A320") are NOT used as anchors to avoid false positives
+            // with aircraft model numbers.
+            int firstTimeIndex = normalizedTokens.FindIndex(aircraftStart, IsTimeToken);
+            int firstBracketedIndex = normalizedTokens.FindIndex(aircraftStart, IsBracketedIcaoCode);
 
-            var icaoCodes = normalizedTokens.Where(IsIcaoCode).ToList();
-            string? from = icaoCodes.ElementAtOrDefault(0);
-            string? to = icaoCodes.ElementAtOrDefault(1);
+            int aircraftEnd;
+            string? departureTime;
+            int airportSectionStart;
 
-            int aircraftEnd = normalizedTokens.FindIndex(aircraftStart, t => IsTimeToken(t) || IsIcaoCode(t) || IsDurationToken(t));
-            if (aircraftEnd < 0)
-                aircraftEnd = normalizedTokens.Count;
+            if (firstTimeIndex >= 0 && (firstBracketedIndex < 0 || firstTimeIndex < firstBracketedIndex))
+            {
+                // Time comes first (or no bracketed code): departure time found
+                departureTime = normalizedTokens[firstTimeIndex];
+                aircraftEnd = firstTimeIndex;
+                airportSectionStart = firstTimeIndex + 1;
+            }
+            else if (firstBracketedIndex >= 0)
+            {
+                // Bracketed airport code precedes any time token: no departure time logged
+                departureTime = null;
+                aircraftEnd = firstBracketedIndex;
+                airportSectionStart = firstBracketedIndex;
+            }
+            else
+            {
+                return null;
+            }
 
+            // Aircraft name — strip single-char tokens (OCR misreads of the '|' column separator)
             var aircraftTokens = normalizedTokens
                 .Skip(aircraftStart)
                 .Take(aircraftEnd - aircraftStart)
-                .Where(t => t != "|")
+                .Where(t => t.Length > 1)
+                .ToList();
+            string aircraft = string.Join(" ", aircraftTokens).Trim();
+
+            // Collect all ICAO codes in the airport section
+            var airportCodes = normalizedTokens
+                .Skip(airportSectionStart)
+                .Select(ExtractIcaoCode)
+                .Where(code => !string.IsNullOrWhiteSpace(code))
                 .ToList();
 
-            string aircraft = string.Join(" ", aircraftTokens).Trim();
-            if (string.IsNullOrWhiteSpace(aircraft) && aircraftTokens.Count == 0 && normalizedTokens.Count > aircraftStart)
-            {
-                aircraft = normalizedTokens[aircraftStart];
-            }
+            string? from = airportCodes.ElementAtOrDefault(0);
+            string? to = airportCodes.ElementAtOrDefault(1);
 
-            if (string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(to) || string.IsNullOrWhiteSpace(departureTime) || string.IsNullOrWhiteSpace(arrivalTime))
+            if (string.IsNullOrWhiteSpace(from))
                 return null;
+
+            // Arrival time: first time token after the from-airport position
+            int firstAirportPos = normalizedTokens.FindIndex(airportSectionStart, t => ExtractIcaoCode(t) != null);
+            int arrivalIndex = firstAirportPos >= 0 ? normalizedTokens.FindIndex(firstAirportPos + 1, IsTimeToken) : -1;
+            string? arrivalTime = arrivalIndex >= 0 ? normalizedTokens[arrivalIndex] : null;
+
+            string? duration = normalizedTokens.FirstOrDefault(IsDurationToken) ?? string.Empty;
 
             return new FlightRecord
             {
@@ -303,6 +558,11 @@ namespace MsfsLogbookAnalyzer
                 To = to,
                 Duration = duration
             };
+        }
+
+        private static bool IsBracketedIcaoCode(string token)
+        {
+            return Regex.IsMatch(token, @"^\[[A-Z0-9]{3,5}\]$");
         }
 
         private static readonly string[] DatePatterns = new[]
@@ -343,9 +603,43 @@ namespace MsfsLogbookAnalyzer
             return Regex.IsMatch(token, @"^\d{1,2}[:\.]\d{2}[:\.]\d{2}$");
         }
 
-        private static bool IsIcaoCode(string token)
+// Common OCR misreads where two characters are substituted for one
+        private static readonly (string From, string To)[] OcrDigraphFixes =
         {
-            return Regex.IsMatch(token, @"^[A-Z]{4}$");
+            ("IJ", "U"),  // "U" read as "IJ" (e.g. KBIJR → KBUR)
+            ("VV", "W"),
+            ("RN", "M"),
+        };
+
+        private static string? ExtractIcaoCode(string? token)
+        {
+            if (string.IsNullOrWhiteSpace(token))
+                return null;
+
+            // Standard 3-4 char code (ICAO, IATA, FAA)
+            if (Regex.IsMatch(token, @"^(?=.*[A-Z])[A-Z0-9]{3,4}$"))
+                return token;
+
+            // Bracketed format like [EFSI] Vicinity or [CEK9B] (up to 5 chars)
+            var match = Regex.Match(token, @"\[([A-Z0-9]{3,5})\]");
+            if (match.Success)
+                return match.Groups[1].Value;
+
+            // 5-char alphanumeric with at least one letter: try OCR digraph correction first
+            // (e.g., "KBIJR" → "KBUR" via IJ→U), then accept as a legitimate 5-char identifier
+            // (Transport Canada, some FAA private/small airfield codes)
+            if (Regex.IsMatch(token, @"^(?=.*[A-Z])[A-Z0-9]{5}$"))
+            {
+                foreach (var (from, to) in OcrDigraphFixes)
+                {
+                    var corrected = token.Replace(from, to);
+                    if (Regex.IsMatch(corrected, @"^(?=.*[A-Z])[A-Z0-9]{3,4}$"))
+                        return corrected;
+                }
+                return token;
+            }
+
+            return null;
         }
 
         // Export flights to JSON or XML
@@ -446,6 +740,74 @@ namespace MsfsLogbookAnalyzer
                 catch (Exception ex)
                 {
                     MessageBox.Show($"Error loading/appending: {ex.Message}");
+                }
+            }
+        }
+
+        // Convert format between JSON and XML
+        private void ConvertFormat_Click(object sender, RoutedEventArgs e)
+        {
+            var openFileDialog = new OpenFileDialog
+            {
+                Filter = "JSON or XML files (*.json;*.xml)|*.json;*.xml"
+            };
+
+            if (openFileDialog.ShowDialog() == true)
+            {
+                try
+                {
+                    List<FlightRecord> records;
+                    string sourceFormat = Path.GetExtension(openFileDialog.FileName).ToLower();
+
+                    // Load the file
+                    if (sourceFormat == ".json")
+                    {
+                        var json = File.ReadAllText(openFileDialog.FileName);
+                        records = JsonSerializer.Deserialize<List<FlightRecord>>(json) ?? new List<FlightRecord>();
+                    }
+                    else
+                    {
+                        var serializer = new XmlSerializer(typeof(List<FlightRecord>));
+                        using var reader = new StreamReader(openFileDialog.FileName);
+                        records = (List<FlightRecord>?)serializer.Deserialize(reader) ?? new List<FlightRecord>();
+                    }
+
+                    if (records.Count == 0)
+                    {
+                        MessageBox.Show("No flight records found in the file.");
+                        return;
+                    }
+
+                    // Ask for target format
+                    string targetFormat = sourceFormat == ".json" ? "XML" : "JSON";
+                    var saveFileDialog = new SaveFileDialog
+                    {
+                        Filter = targetFormat == "JSON" ? "JSON files (*.json)|*.json" : "XML files (*.xml)|*.xml",
+                        DefaultExt = targetFormat == "JSON" ? "json" : "xml",
+                        FileName = Path.GetFileNameWithoutExtension(openFileDialog.FileName) + "_converted"
+                    };
+
+                    if (saveFileDialog.ShowDialog() == true)
+                    {
+                        // Save in target format
+                        if (targetFormat == "JSON")
+                        {
+                            var json = JsonSerializer.Serialize(records, new JsonSerializerOptions { WriteIndented = true });
+                            File.WriteAllText(saveFileDialog.FileName, json);
+                        }
+                        else
+                        {
+                            var serializer = new XmlSerializer(typeof(List<FlightRecord>));
+                            using var writer = new StreamWriter(saveFileDialog.FileName);
+                            serializer.Serialize(writer, records);
+                        }
+
+                        MessageBox.Show($"File converted and saved as {targetFormat} successfully.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"Error converting file: {ex.Message}");
                 }
             }
         }
